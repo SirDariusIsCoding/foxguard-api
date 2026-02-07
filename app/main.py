@@ -65,10 +65,11 @@ async def fetch_entitlements_from_base44(account_id: str) -> dict:
       - JSON body with account_id
       - Header: x-api-key
     """
-    headers = {
-        "Content-Type": "application/json",
-        "x-api-key": BASE44_API_KEY,
-    }
+headers = {
+    "Content-Type": "application/json",
+    "api_key": BASE44_API_KEY
+}
+
 
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.post(
