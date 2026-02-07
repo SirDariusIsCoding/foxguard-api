@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from typing import Optional, Dict, Any
 import os
 import hmac
 import hashlib
@@ -9,6 +10,8 @@ import time
 from datetime import datetime, timezone
 from collections import defaultdict
 
+import httpx
+
 app = FastAPI(title="FoxGuard API")
 
 # ------------------------------------------------------------------
@@ -16,13 +19,19 @@ app = FastAPI(title="FoxGuard API")
 # ------------------------------------------------------------------
 
 SIGNING_KEY = os.getenv("FOXGUARD_SIGNING_KEY")
-
 if not SIGNING_KEY:
     raise RuntimeError("FOXGUARD_SIGNING_KEY is not set")
 
+BASE44_ENTITLEMENTS_URL = os.getenv("BASE44_ENTITLEMENTS_URL")  # Base44 function URL: getEntitlements
+FOXGUARD_BASE44_API_KEY = os.getenv("FOXGUARD_BASE44_API_KEY")  # must match Base44 env
+BASE44_ME_URL = os.getenv("BASE44_ME_URL")  # Base44 /auth/me (or equivalent)
+
+TOKEN_TTL_DAYS = int(os.getenv("FOXGUARD_TOKEN_TTL_DAYS", "30"))
+
 # ------------------------------------------------------------------
 # In-memory usage tracking (v1)
-# key = (account_or_license, device_id, YYYY-MM-DD)
+# NOTE: This resets on redeploy. Later: Redis/Postgres.
+# key = (account_id, device_id, YYYY-MM-DD, action)
 # ------------------------------------------------------------------
 
 usage_counter = defaultdict(int)
@@ -32,7 +41,13 @@ usage_counter = defaultdict(int)
 # ------------------------------------------------------------------
 
 class ActivateRequest(BaseModel):
-    license_key: str
+    # Legacy path (no login yet):
+    license_key: Optional[str] = None
+
+    # Login bridge path:
+    account_id: Optional[str] = None
+    session_token: Optional[str] = None  # from Base44 login/session
+
     device_id: str
     app_version: str
 
@@ -41,25 +56,41 @@ class ActivateResponse(BaseModel):
     plan: str
     expires_at: int
     license_token: str
+    entitlement: Optional[Dict[str, Any]] = None  # helpful for debugging/UI
 
 
 class CheckRequest(BaseModel):
     license_token: str
-    action: str | None = "batch_execute"
+    action: str = "batch_execute"
+    units: int = 1  # future use; v1 mostly 1 per batch
+
+
+class ReportUsageRequest(BaseModel):
+    license_token: str
+    action: str = "batch_execute"
+    units: int = 1
+    batch_id: Optional[str] = None  # optional idempotency later
 
 
 # ------------------------------------------------------------------
-# Helpers
+# Helpers: signing + verification
 # ------------------------------------------------------------------
+
+def _b64e(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode()
+
+
+def _b64d(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s.encode())
+
 
 def sign_payload(payload: dict) -> str:
     """
-    Create a signed license token.
-    Format:
+    Token format:
     base64(payload_json).base64(signature)
     """
-    payload_json = json.dumps(payload, separators=(",", ":")).encode()
-    payload_b64 = base64.urlsafe_b64encode(payload_json).decode()
+    payload_json = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
+    payload_b64 = _b64e(payload_json)
 
     signature = hmac.new(
         SIGNING_KEY.encode(),
@@ -67,16 +98,11 @@ def sign_payload(payload: dict) -> str:
         hashlib.sha256
     ).digest()
 
-    signature_b64 = base64.urlsafe_b64encode(signature).decode()
-
+    signature_b64 = _b64e(signature)
     return f"{payload_b64}.{signature_b64}"
 
 
 def verify_license_token(token: str) -> dict:
-    """
-    Verify token signature + expiration.
-    Returns payload if valid.
-    """
     try:
         payload_b64, signature_b64 = token.split(".")
     except ValueError:
@@ -88,20 +114,31 @@ def verify_license_token(token: str) -> dict:
         hashlib.sha256
     ).digest()
 
-    actual_sig = base64.urlsafe_b64decode(signature_b64.encode())
+    try:
+        actual_sig = _b64d(signature_b64)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Malformed token signature")
 
     if not hmac.compare_digest(expected_sig, actual_sig):
         raise HTTPException(status_code=401, detail="Invalid token signature")
 
-    payload_json = base64.urlsafe_b64decode(payload_b64.encode())
-    payload = json.loads(payload_json)
+    try:
+        payload_json = _b64d(payload_b64)
+        payload = json.loads(payload_json)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Malformed token payload")
 
     now = int(time.time())
-    if payload.get("expires_at") and payload["expires_at"] < now:
-        raise HTTPException(status_code=401, detail="License expired")
+    exp = payload.get("expires_at")
+    if exp is not None and int(exp) < now:
+        raise HTTPException(status_code=401, detail="License token expired")
 
     return payload
 
+
+# ------------------------------------------------------------------
+# Helpers: usage window + counters
+# ------------------------------------------------------------------
 
 def utc_day_key() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -115,16 +152,74 @@ def end_of_utc_day_ts() -> int:
     )
 
 
+def _usage_key(account_id: str, device_id: str, day: str, action: str) -> tuple:
+    return (account_id, device_id, day, action)
+
+
+# ------------------------------------------------------------------
+# Helpers: Base44 integration
+# ------------------------------------------------------------------
+
+async def base44_validate_session(account_id: str, session_token: str) -> None:
+    """
+    Validates that session_token is valid and belongs to account_id.
+    This assumes Base44 /auth/me responds with the current account info.
+    """
+    if not BASE44_ME_URL:
+        raise HTTPException(status_code=500, detail="BASE44_ME_URL not configured")
+
+    headers = {
+        "Authorization": f"Bearer {session_token}",
+        "Accept": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(BASE44_ME_URL, headers=headers)
+        if r.status_code != 200:
+            raise HTTPException(status_code=401, detail="Invalid session_token")
+
+        data = r.json()
+        # We expect it to contain account_id (adjust this if Base44 returns a different shape)
+        returned_id = data.get("account_id") or data.get("id") or data.get("user", {}).get("account_id")
+        if returned_id and str(returned_id) != str(account_id):
+            raise HTTPException(status_code=401, detail="Session does not match account_id")
+
+
+async def base44_get_entitlements(account_id: str) -> Dict[str, Any]:
+    """
+    Calls your Base44 getEntitlements function.
+    Your Base44 function expects:
+      - header x-api-key
+      - JSON body { account_id }
+    """
+    if not BASE44_ENTITLEMENTS_URL or not FOXGUARD_BASE44_API_KEY:
+        raise HTTPException(status_code=500, detail="Base44 entitlements integration not configured")
+
+    headers = {
+        "x-api-key": FOXGUARD_BASE44_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(BASE44_ENTITLEMENTS_URL, headers=headers, json={"account_id": account_id})
+        if r.status_code == 401:
+            raise HTTPException(status_code=500, detail="Base44 entitlements unauthorized (check API key)")
+        if r.status_code == 404:
+            raise HTTPException(status_code=404, detail="Account not found in Base44")
+        if r.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"Base44 entitlements error: {r.status_code}")
+
+        return r.json()
+
+
 # ------------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------------
 
 @app.get("/")
 def root():
-    return {
-        "service": "FoxGuard",
-        "status": "online"
-    }
+    return {"service": "FoxGuard", "status": "online"}
 
 
 @app.get("/ping")
@@ -133,33 +228,90 @@ def ping():
 
 
 @app.post("/activate", response_model=ActivateResponse)
-def activate(req: ActivateRequest):
+async def activate(req: ActivateRequest):
     """
-    V1 activation logic (stubbed):
+    Activation + token issuance.
 
-    - Accept any non-empty license key
-    - Issue a Pro license token
-    - Valid for 30 days
+    Supports two paths:
+    1) Login bridge path (preferred):
+       - account_id + session_token provided
+       - FoxGuard validates session with Base44
+       - FoxGuard fetches Base44 entitlements
+       - FoxGuard signs token embedding the entitlement snapshot
+
+    2) Legacy license_key path (temporary):
+       - license_key provided
+       - issues a stub "pro" token (useful during bring-up)
     """
-
-    if not req.license_key.strip():
-        raise HTTPException(status_code=400, detail="Invalid license key")
-
     now = int(time.time())
-    expires_at = now + (30 * 24 * 60 * 60)  # 30 days
+
+    # ----------------------------
+    # Path A: account login bridge
+    # ----------------------------
+    if req.account_id and req.session_token:
+        # Validate session is real (prevents random account_id spoofing)
+        await base44_validate_session(req.account_id, req.session_token)
+
+        ent = await base44_get_entitlements(req.account_id)
+
+        plan = ent.get("plan", "free")
+        fraud_flag = bool(ent.get("fraud_flag", False))
+        limits = ent.get("limits", {}) or {}
+        policy = ent.get("policy", {}) or {}
+
+        # Token expiry: short-lived “license token” that must refresh periodically.
+        # If Base44 has expires_at, we never go past it.
+        entitlement_expires_at = ent.get("expires_at")  # may be null
+        token_ttl_seconds = TOKEN_TTL_DAYS * 24 * 60 * 60
+        token_exp = now + token_ttl_seconds
+
+        if entitlement_expires_at:
+            try:
+                token_exp = min(token_exp, int(entitlement_expires_at))
+            except Exception:
+                pass
+
+        payload = {
+            "schema_version": "v1",
+            "account_id": req.account_id,
+            "device_id": req.device_id,
+            "app_version": req.app_version,
+            "plan": plan,
+            "limits": limits,
+            "policy": policy,
+            "fraud_flag": fraud_flag,
+            "issued_at": now,
+            "expires_at": int(token_exp),
+            "entitlement_snapshot": ent,  # embed full snapshot for offline verification
+        }
+
+        token = sign_payload(payload)
+
+        return ActivateResponse(
+            plan=plan,
+            expires_at=int(token_exp),
+            license_token=token,
+            entitlement=ent
+        )
+
+    # ----------------------------
+    # Path B: legacy license_key
+    # ----------------------------
+    if not req.license_key or not req.license_key.strip():
+        raise HTTPException(status_code=400, detail="Provide account_id+session_token OR license_key")
+
+    expires_at = now + (TOKEN_TTL_DAYS * 24 * 60 * 60)
 
     payload = {
-        "account_id": f"local-{req.license_key[-4:]}",  # placeholder until Base44
+        "schema_version": "v1",
+        "account_id": f"legacy-{req.license_key[-4:]}",
         "license_key_last4": req.license_key[-4:],
         "device_id": req.device_id,
+        "app_version": req.app_version,
         "plan": "pro",
-        "limits": {
-            "daily_batches": None  # unlimited
-        },
-        "policy": {
-            "requires_online": False,
-            "offline_allowed": True
-        },
+        "limits": {"daily_batches": None},
+        "policy": {"requires_online": False, "offline_allowed": True},
+        "fraud_flag": False,
         "issued_at": now,
         "expires_at": expires_at,
     }
@@ -169,46 +321,45 @@ def activate(req: ActivateRequest):
     return ActivateResponse(
         plan="pro",
         expires_at=expires_at,
-        license_token=token
+        license_token=token,
+        entitlement=None
     )
 
 
 @app.post("/check")
 def check(req: CheckRequest):
     """
-    Runtime enforcement endpoint.
-    Called before each batch execution.
-    """
+    Non-consuming gate check.
+    Use this BEFORE a batch runs to decide allow/deny.
 
+    Consumption happens in /report_usage after completion (async-friendly).
+    """
     payload = verify_license_token(req.license_token)
 
-    account_id = payload.get("account_id", payload.get("license_key_last4"))
-    device_id = payload.get("device_id")
     plan = payload.get("plan", "free")
-    limits = payload.get("limits", {})
-    policy = payload.get("policy", {})
+    fraud_flag = bool(payload.get("fraud_flag", False))
+    limits = payload.get("limits", {}) or {}
+    policy = payload.get("policy", {}) or {}
 
-    # ---- Online enforcement (future-safe)
-    if policy.get("requires_online") is True:
-        # Token validation already confirms online trust
-        pass
+    if fraud_flag:
+        return {"allowed": False, "reason": "account_flagged"}
 
-    # ---- Pro users: always allowed
+    # If Free requires online, they should be calling FoxGuard anyway (this endpoint is online).
+    # Pro may be offline (no call).
     if plan == "pro":
-        return {
-            "allowed": True,
-            "remaining": None,
-            "reset_at": None
-        }
+        return {"allowed": True, "remaining": None, "reset_at": None}
 
-    # ---- Free tier enforcement
+    account_id = payload.get("account_id")
+    device_id = payload.get("device_id")
+    if not account_id or not device_id:
+        raise HTTPException(status_code=401, detail="Token missing identity fields")
+
     daily_limit = limits.get("daily_batches", 5)
+    day = utc_day_key()
+    key = _usage_key(account_id, device_id, day, req.action)
+    used = usage_counter[key]
 
-    today = utc_day_key()
-    usage_key = (account_id, device_id, today)
-    current_count = usage_counter[usage_key]
-
-    if current_count >= daily_limit:
+    if used >= daily_limit:
         return {
             "allowed": False,
             "reason": "daily_limit_exceeded",
@@ -216,11 +367,67 @@ def check(req: CheckRequest):
             "reset_at": end_of_utc_day_ts()
         }
 
-    # ---- Allow + increment
-    usage_counter[usage_key] += 1
-
+    remaining = max(0, daily_limit - used)
     return {
         "allowed": True,
-        "remaining": daily_limit - usage_counter[usage_key],
+        "remaining": remaining,
+        "reset_at": end_of_utc_day_ts()
+    }
+
+
+@app.post("/report_usage")
+def report_usage(req: ReportUsageRequest):
+    """
+    Consumes usage AFTER a batch completes.
+    This supports async enforcement (your batch can run, then report).
+
+    For Free tier, this is what increments daily usage.
+    """
+    payload = verify_license_token(req.license_token)
+
+    plan = payload.get("plan", "free")
+    fraud_flag = bool(payload.get("fraud_flag", False))
+    limits = payload.get("limits", {}) or {}
+
+    if fraud_flag:
+        return {"accepted": False, "reason": "account_flagged"}
+
+    # Pro: no quota consumption needed (still accepted)
+    if plan == "pro":
+        return {"accepted": True, "plan": "pro", "remaining": None, "reset_at": None}
+
+    account_id = payload.get("account_id")
+    device_id = payload.get("device_id")
+    if not account_id or not device_id:
+        raise HTTPException(status_code=401, detail="Token missing identity fields")
+
+    daily_limit = limits.get("daily_batches", 5)
+    units = max(1, int(req.units))
+
+    day = utc_day_key()
+    key = _usage_key(account_id, device_id, day, req.action)
+
+    usage_counter[key] += units
+    used = usage_counter[key]
+
+    if used > daily_limit:
+        # We still accept the report, but signal they are now over quota.
+        return {
+            "accepted": True,
+            "plan": "free",
+            "over_quota": True,
+            "limit": daily_limit,
+            "used": used,
+            "remaining": 0,
+            "reset_at": end_of_utc_day_ts()
+        }
+
+    return {
+        "accepted": True,
+        "plan": "free",
+        "over_quota": False,
+        "limit": daily_limit,
+        "used": used,
+        "remaining": max(0, daily_limit - used),
         "reset_at": end_of_utc_day_ts()
     }
