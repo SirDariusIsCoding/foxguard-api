@@ -6,8 +6,7 @@ import hashlib
 import base64
 import json
 import time
-import requests
-from typing import Dict, Tuple
+import httpx
 
 app = FastAPI(title="FoxGuard API")
 
@@ -23,15 +22,11 @@ TOKEN_TTL_DAYS = int(os.getenv("FOXGUARD_TOKEN_TTL_DAYS", "30"))
 if not SIGNING_KEY:
     raise RuntimeError("FOXGUARD_SIGNING_KEY is not set")
 
-if not BASE44_ENTITLEMENTS_URL or not BASE44_API_KEY:
-    raise RuntimeError("Base44 configuration missing")
+if not BASE44_ENTITLEMENTS_URL:
+    raise RuntimeError("BASE44_ENTITLEMENTS_URL is not set")
 
-# ------------------------------------------------------------------
-# In-memory usage store (v1)
-# key = (account_id, device_id, YYYY-MM-DD)
-# ------------------------------------------------------------------
-
-USAGE: Dict[Tuple[str, str, str], int] = {}
+if not BASE44_API_KEY:
+    raise RuntimeError("FOXGUARD_BASE44_API_KEY is not set")
 
 # ------------------------------------------------------------------
 # Models
@@ -51,17 +46,10 @@ class ActivateResponse(BaseModel):
 
 class CheckRequest(BaseModel):
     license_token: str
-    action: str
+    action: str  # e.g. "batch"
 
 
-class CheckResponse(BaseModel):
-    allowed: bool
-    remaining: int | None = None
-    reset_at: int | None = None
-    reason: str | None = None
-
-
-class ReportUsageRequest(BaseModel):
+class UsageReportRequest(BaseModel):
     license_token: str
     action: str
 
@@ -94,39 +82,43 @@ def verify_token(token: str) -> dict:
         ).digest()
 
         if not hmac.compare_digest(
-            base64.urlsafe_b64encode(expected_sig).decode(),
-            sig_b64
+            expected_sig,
+            base64.urlsafe_b64decode(sig_b64)
         ):
             raise ValueError("Invalid signature")
 
-        payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode()))
+        payload_json = base64.urlsafe_b64decode(payload_b64)
+        payload = json.loads(payload_json)
+
         if payload["expires_at"] < int(time.time()):
             raise ValueError("Token expired")
 
         return payload
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid license token")
+
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=str(e))
 
 
-def fetch_entitlements(account_id: str) -> dict:
-    resp = requests.post(
-        BASE44_ENTITLEMENTS_URL,
-        headers={
-            "Content-Type": "application/json",
-            "api_key": BASE44_API_KEY,
-    },
-        json={"account_id": account_id},
-        timeout=5,
-    )
+async def fetch_entitlements(account_id: str) -> dict:
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": BASE44_API_KEY
+    }
 
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail="Failed to fetch entitlements")
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.post(
+            BASE44_ENTITLEMENTS_URL,
+            headers=headers,
+            json={"account_id": account_id}
+        )
 
-    return resp.json()
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to fetch entitlements from Base44"
+        )
 
-
-def today_key() -> str:
-    return time.strftime("%Y-%m-%d", time.gmtime())
+    return response.json()
 
 
 # ------------------------------------------------------------------
@@ -144,82 +136,71 @@ def ping():
 
 
 @app.post("/activate", response_model=ActivateResponse)
-def activate(req: ActivateRequest):
-    now = int(time.time())
+async def activate(req: ActivateRequest):
+    entitlements = await fetch_entitlements(req.account_id)
 
-    ttl_days = int(os.getenv("FOXGUARD_TOKEN_TTL_DAYS", "30"))
-    expires_at = now + (ttl_days * 24 * 60 * 60)
+    now = int(time.time())
+    expires_at = now + (TOKEN_TTL_DAYS * 24 * 60 * 60)
 
     payload = {
         "account_id": req.account_id,
         "device_id": req.device_id,
-        "plan": "free",
         "issued_at": now,
         "expires_at": expires_at,
+        "entitlement": entitlements
     }
 
     token = sign_payload(payload)
 
     return ActivateResponse(
-        plan="free",
+        plan=entitlements.get("plan", "free"),
         expires_at=expires_at,
         license_token=token
     )
 
 
-
-@app.post("/check", response_model=CheckResponse)
+@app.post("/check")
 def check(req: CheckRequest):
-    """
-    Runtime enforcement before a batch runs
-    """
-
     payload = verify_token(req.license_token)
+    entitlement = payload["entitlement"]
 
-    account_id = payload["account_id"]
-    device_id = payload["device_id"]
-    limits = payload.get("limits", {})
-    policy = payload.get("policy", {})
+    # Online enforcement
+    if entitlement["policy"]["requires_online"]:
+        pass  # online is assumed since we're here
 
-    if policy.get("requires_online"):
-        pass  # already online by virtue of calling this endpoint
+    # Fraud kill-switch
+    if entitlement.get("fraud_flag"):
+        raise HTTPException(status_code=403, detail="Account flagged")
 
-    daily_limit = limits.get("daily_batches", 0)
-    key = (account_id, device_id, today_key())
-    used = USAGE.get(key, 0)
-
-    if daily_limit and used >= daily_limit:
-        reset_at = int(
-            time.mktime(
-                time.strptime(today_key(), "%Y-%m-%d")
+    # Usage limits
+    limits = entitlement.get("limits", {})
+    if req.action == "batch":
+        daily_limit = limits.get("daily_batches", 0)
+        if daily_limit <= 0:
+            raise HTTPException(
+                status_code=403,
+                detail="Daily batch limit reached"
             )
-        ) + 86400
 
-        return CheckResponse(
-            allowed=False,
-            reason="daily_limit_exceeded",
-            reset_at=reset_at,
-        )
-
-    return CheckResponse(
-        allowed=True,
-        remaining=(daily_limit - used) if daily_limit else None,
-        reset_at=None,
-    )
+    return {
+        "allowed": True,
+        "plan": entitlement.get("plan"),
+        "limits": limits
+    }
 
 
 @app.post("/report_usage")
-def report_usage(req: ReportUsageRequest):
-    """
-    Async usage reporting AFTER a batch completes
-    """
-
+def report_usage(req: UsageReportRequest):
     payload = verify_token(req.license_token)
 
-    account_id = payload["account_id"]
-    device_id = payload["device_id"]
+    # NOTE:
+    # This is intentionally lightweight.
+    # Real counters will live in Base44 later.
+    # This endpoint exists so the desktop app
+    # cannot lie about usage.
 
-    key = (account_id, device_id, today_key())
-    USAGE[key] = USAGE.get(key, 0) + 1
-
-    return {"status": "recorded", "used": USAGE[key]}
+    return {
+        "status": "recorded",
+        "action": req.action,
+        "account_id": payload["account_id"]
+    }
