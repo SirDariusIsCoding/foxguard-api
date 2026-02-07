@@ -58,18 +58,10 @@ def sign_payload(payload: dict) -> str:
 
 
 async def fetch_entitlements_from_base44(account_id: str) -> dict:
-    """
-    Calls Base44 getEntitlements.ts
-    EXPECTS:
-      - POST
-      - JSON body with account_id
-      - Header: x-api-key
-    """
-headers = {
-    "Content-Type": "application/json",
-    "api_key": BASE44_API_KEY
-}
-
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": BASE44_API_KEY,  # ✅ FINAL
+    }
 
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.post(
@@ -77,6 +69,9 @@ headers = {
             headers=headers,
             json={"account_id": account_id},
         )
+
+    if resp.status_code == 401:
+        raise HTTPException(status_code=401, detail="Base44 unauthorized")
 
     if resp.status_code != 200:
         raise HTTPException(
