@@ -113,8 +113,8 @@ def fetch_entitlements(account_id: str) -> dict:
         BASE44_ENTITLEMENTS_URL,
         headers={
             "Content-Type": "application/json",
-            "x-api-key": BASE44_API_KEY,
-        },
+            "api_key": BASE44_API_KEY,
+    },
         json={"account_id": account_id},
         timeout=5,
     )
