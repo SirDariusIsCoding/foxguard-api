@@ -145,25 +145,15 @@ def ping():
 
 @app.post("/activate", response_model=ActivateResponse)
 def activate(req: ActivateRequest):
-    """
-    Activation:
-    - Fetch entitlements from Base44
-    - Sign snapshot into token
-    """
-
-    entitlements = fetch_entitlements(req.account_id)
-
     now = int(time.time())
-    expires_at = entitlements.get("expires_at") or (
-        now + TOKEN_TTL_DAYS * 86400
-    )
+
+    ttl_days = int(os.getenv("FOXGUARD_TOKEN_TTL_DAYS", "30"))
+    expires_at = now + (ttl_days * 24 * 60 * 60)
 
     payload = {
-        "account_id": entitlements["account_id"],
+        "account_id": req.account_id,
         "device_id": req.device_id,
-        "plan": entitlements["plan"],
-        "limits": entitlements["limits"],
-        "policy": entitlements["policy"],
+        "plan": "free",
         "issued_at": now,
         "expires_at": expires_at,
     }
@@ -171,10 +161,11 @@ def activate(req: ActivateRequest):
     token = sign_payload(payload)
 
     return ActivateResponse(
-        plan=payload["plan"],
+        plan="free",
         expires_at=expires_at,
-        license_token=token,
+        license_token=token
     )
+
 
 
 @app.post("/check", response_model=CheckResponse)
